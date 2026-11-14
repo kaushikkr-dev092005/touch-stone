@@ -1,0 +1,489 @@
+"""Integer-money accounting, serializable reservations, and durable audit events."""
+from contextlib import contextmanager
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+import time
+import uuid
+
+
+class PolicyError(Exception):
+    pass
+
+
+class ClosingConnection(sqlite3.Connection):
+    """sqlite's native context manager commits but does not close its handle."""
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def payment_key(job_id, step_id, attempt):
+    return hashlib.sha256(f"{job_id}:{step_id}:{attempt}".encode()).hexdigest()
+
+
+class Ledger:
+    def __init__(self, path="data/ledger.sqlite"):
+        self.path = str(path)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as db:
+            db.executescript("""
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS control(id INTEGER PRIMARY KEY CHECK(id=1), halted INTEGER NOT NULL);
+            INSERT OR IGNORE INTO control VALUES(1,0);
+            CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, float_total INTEGER NOT NULL CHECK(float_total>=0));
+            CREATE TABLE IF NOT EXISTS jobs(
+              id TEXT PRIMARY KEY, run_id TEXT REFERENCES runs(id), seed INTEGER NOT NULL,
+              policy TEXT NOT NULL, status TEXT NOT NULL, budget INTEGER NOT NULL, hold INTEGER NOT NULL,
+              price_cap INTEGER NOT NULL, allocation INTEGER NOT NULL, rail_spent INTEGER NOT NULL DEFAULT 0,
+              spent INTEGER NOT NULL DEFAULT 0, captured INTEGER NOT NULL DEFAULT 0,
+              released INTEGER NOT NULL DEFAULT 0, expires_at REAL NOT NULL, tasks TEXT NOT NULL,
+              mandate_version INTEGER NOT NULL DEFAULT 1,
+              CHECK(spent>=0 AND spent<=budget AND budget<=hold), CHECK(captured<=hold));
+            CREATE TABLE IF NOT EXISTS attempts(
+              key TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), step_id TEXT NOT NULL,
+              attempt INTEGER NOT NULL, state TEXT NOT NULL, quote TEXT NOT NULL,
+              provider TEXT NOT NULL, price INTEGER NOT NULL CHECK(price>0), verify_cost INTEGER NOT NULL,
+              output TEXT, score REAL, passed INTEGER, reason TEXT, receipt TEXT, provider_metadata TEXT,
+              UNIQUE(job_id,step_id,attempt));
+            CREATE TABLE IF NOT EXISTS payments(
+              key TEXT PRIMARY KEY REFERENCES attempts(key), receipt TEXT UNIQUE NOT NULL,
+              amount INTEGER NOT NULL CHECK(amount>0));
+            CREATE TABLE IF NOT EXISTS worker_leases(
+              job_id TEXT PRIMARY KEY REFERENCES jobs(id), token TEXT NOT NULL,
+              acquired_at REAL NOT NULL, active INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS events(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, kind TEXT NOT NULL,
+              payload TEXT NOT NULL, previous_hash TEXT NOT NULL, hash TEXT UNIQUE NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+              BEGIN SELECT RAISE(ABORT,'audit events are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+              BEGIN SELECT RAISE(ABORT,'audit events are append-only'); END;
+            """)
+            columns = {r["name"] for r in db.execute("PRAGMA table_info(attempts)")}
+            if "verdict" not in columns:
+                db.execute("ALTER TABLE attempts ADD COLUMN verdict TEXT")
+            if "provider_metadata" not in columns:
+                db.execute("ALTER TABLE attempts ADD COLUMN provider_metadata TEXT")
+            if "mandate_version" not in columns:
+                db.execute("ALTER TABLE attempts ADD COLUMN mandate_version INTEGER NOT NULL DEFAULT 1")
+            if "dispatched_at" not in columns:
+                db.execute("ALTER TABLE attempts ADD COLUMN dispatched_at REAL")
+            if "worker_token" not in columns:
+                db.execute("ALTER TABLE attempts ADD COLUMN worker_token TEXT")
+            job_columns = {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}
+            if "mandate_version" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN mandate_version INTEGER NOT NULL DEFAULT 1")
+            run_columns = {r['name'] for r in db.execute('PRAGMA table_info(runs)')}
+            if 'float_mode' not in run_columns:
+                db.execute("ALTER TABLE runs ADD COLUMN float_mode TEXT NOT NULL DEFAULT 'SIMULATED'")
+            if 'failed_call_policy' not in run_columns:
+                db.execute("ALTER TABLE runs ADD COLUMN failed_call_policy TEXT NOT NULL DEFAULT 'CUSTOMER_PAYS'")
+            if 'require_approvals' not in run_columns:
+                db.execute("ALTER TABLE runs ADD COLUMN require_approvals INTEGER NOT NULL DEFAULT 0")
+            db.executescript('''CREATE TRIGGER IF NOT EXISTS billing_policy_immutable
+                BEFORE UPDATE OF failed_call_policy ON runs WHEN NEW.failed_call_policy<>OLD.failed_call_policy
+                BEGIN SELECT RAISE(ABORT,'Billing policy is immutable for this run'); END;''')
+        from .procurement_approval import ApprovalStore
+        self.approvals = ApprovalStore(self)
+
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=15, isolation_level=None, factory=ClosingConnection)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        return db
+
+    @contextmanager
+    def tx(self):
+        db = self.connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _event(self, db, kind, payload):
+        ts = time.time()
+        previous = db.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1").fetchone()
+        previous = previous[0] if previous else "0" * 64
+        data = canonical(payload)
+        digest = hashlib.sha256(canonical([ts, kind, data, previous]).encode()).hexdigest()
+        db.execute("INSERT INTO events(ts,kind,payload,previous_hash,hash) VALUES(?,?,?,?,?)", (ts, kind, data, previous, digest))
+
+    def event(self, kind, payload):
+        with self.tx() as db:
+            self._event(db, kind, payload)
+
+    @contextmanager
+    def worker(self, job_id):
+        from .leases import exclusive
+        identity = hashlib.sha256(job_id.encode()).hexdigest()
+        with exclusive(self.path + '.workers/' + identity + '.sqlite'):
+            token = uuid.uuid4().hex
+            with self.tx() as db:
+                if not db.execute('SELECT 1 FROM jobs WHERE id=?', (job_id,)).fetchone():
+                    raise PolicyError('Unknown worker job')
+                db.execute('INSERT OR REPLACE INTO worker_leases VALUES(?,?,?,1)', (job_id, token, time.time()))
+                self._event(db, 'WORKER_ACQUIRED', {'job_id': job_id, 'token': token})
+            try:
+                yield token
+            finally:
+                with self.tx() as db:
+                    db.execute('UPDATE worker_leases SET active=0 WHERE job_id=? AND token=?', (job_id, token))
+                    self._event(db, 'WORKER_RELEASED', {'job_id': job_id, 'token': token})
+
+    def create_run(self, specs, float_total=1500000, float_mode='SIMULATED', failed_call_policy='CUSTOMER_PAYS', require_approvals=False):
+        from .financials import POLICIES
+        if type(failed_call_policy) is not str or failed_call_policy not in POLICIES or (float_mode!='SIMULATED' and failed_call_policy!='CUSTOMER_PAYS'):
+            raise ValueError('Billing policy must be supported; merchant absorption is a simulated customer contract only')
+        if float_mode not in {'SIMULATED', 'TESTNET'}:
+            raise ValueError('Unsupported float mode')
+        if type(float_total) is not int or float_total <= 0:
+            raise ValueError("Float must be a positive integer in micro-USD")
+        run_id = uuid.uuid4().hex[:12]
+        if not specs or sum(s["allocation"] for s in specs) > float_total:
+            raise PolicyError("Initial allocations exceed the run's float")
+        with self.tx() as db:
+            db.execute("INSERT INTO runs(id,float_total,float_mode,failed_call_policy) VALUES(?,?,?,?)", (run_id, float_total, float_mode, failed_call_policy))
+            db.execute('UPDATE runs SET require_approvals=? WHERE id=?', (int(require_approvals or float_mode=='TESTNET'), run_id))
+            for i, s in enumerate(specs):
+                hold, cap, allocation = s["hold"], s["price_cap"], s["allocation"]
+                if any(type(v) is not int or v <= 0 for v in (hold, cap, allocation)) or allocation > hold:
+                    raise ValueError("Invalid hold, cap or allocation")
+                job_id = f"{run_id}-{i+1}"
+                db.execute("""INSERT INTO jobs(id,run_id,seed,policy,status,budget,hold,price_cap,allocation,expires_at,tasks)
+                              VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                           (job_id, run_id, s["seed"], s["policy"], "RUNNING", hold, hold, cap, allocation,
+                            time.time() + 86400, canonical(s["tasks"])))
+                self._event(db, "HOLD_AUTHORIZED", {"job_id": job_id, "hold": hold, "allocation": allocation,
+                    "mandate_version": 1, "mode": "SIMULATED", "failed_call_policy":failed_call_policy})
+        return run_id
+
+    def get_job(self, job_id):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def jobs(self, run_id=None):
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM jobs WHERE run_id=? ORDER BY id", (run_id,)) if run_id else db.execute("SELECT * FROM jobs ORDER BY rowid DESC")
+            return [dict(r) for r in rows]
+
+    def approve_mandate_increase(self, job_id, expected_version, hold, budget, price_cap, allocation, approver, reason,
+                                 remote=None, dry_run=False):
+        values = (hold, budget, price_cap, allocation)
+        if any(type(value) is not int or value <= 0 for value in values):
+            raise ValueError("Approved mandate limits must be positive integer micro-USD")
+        if type(expected_version) is not int or expected_version < 1:
+            raise ValueError("Expected mandate version must be a positive integer")
+        if not isinstance(approver, str) or not approver.strip() or len(approver.strip()) > 100:
+            raise ValueError("Approver name is required and limited to 100 characters")
+        if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 300:
+            raise ValueError("Approval reason is required and limited to 300 characters")
+        with self.tx() as db:
+            job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise PolicyError("Unknown job")
+            if job["status"] != "PAUSED_POLICY":
+                raise PolicyError("A mandate increase can be approved only while the job is policy-paused")
+            if expected_version != job["mandate_version"]:
+                raise PolicyError("Mandate version changed; refresh before approving")
+            if db.execute("SELECT 1 FROM attempts WHERE job_id=? AND state IN ('RESERVED','DISPATCHING','PAID')", (job_id,)).fetchone():
+                raise PolicyError("Cannot revise a mandate while a purchase outcome is unresolved")
+            if hold <= job["hold"] or budget <= job["budget"]:
+                raise PolicyError("A new version must increase both the hold and job budget")
+            if budget > hold or allocation > hold or price_cap > budget:
+                raise PolicyError("New mandate limits are inconsistent")
+            if hold > 10_000_000:
+                raise PolicyError("Simulated hold cannot exceed USD 10")
+            if allocation < job["rail_spent"]:
+                raise PolicyError("Allocation cannot be below provider spend")
+            run = db.execute("SELECT float_total FROM runs WHERE id=?", (job["run_id"],)).fetchone()
+            allocated = db.execute("SELECT COALESCE(SUM(allocation),0) FROM jobs WHERE run_id=?", (job["run_id"],)).fetchone()[0]
+            if allocated - job["allocation"] + allocation > run["float_total"]:
+                raise PolicyError("Approved allocation exceeds the run's existing operator float")
+            if dry_run:
+                return {"job_id": job_id, "mandate_version": job["mandate_version"], "dry_run": True}
+            old = {name: job[name] for name in ("hold", "budget", "price_cap", "allocation")}
+            new_version = job["mandate_version"] + 1
+            db.execute("UPDATE jobs SET hold=?,budget=?,price_cap=?,allocation=?,mandate_version=? WHERE id=?",
+                       (hold, budget, price_cap, allocation, new_version, job_id))
+            self._event(db, "MANDATE_INCREASE_APPROVED", {
+                "job_id": job_id, "previous_version": job["mandate_version"], "mandate_version": new_version,
+                "previous_limits": old,
+                "approved_limits": {"hold": hold, "budget": budget, "price_cap": price_cap, "allocation": allocation},
+                "approver": approver.strip(), "reason": reason.strip(),
+                "mode": "SIMULATED" if remote is None else "SANDBOX_SUPPLEMENTAL_AUTHORIZATION",
+                "remote_authorization": remote})
+            return {"job_id": job_id, "mandate_version": new_version, "status": job["status"],
+                    "hold": hold, "budget": budget, "price_cap": price_cap, "allocation": allocation,
+                    "mode": "SIMULATED" if remote is None else "SANDBOX_SUPPLEMENTAL_AUTHORIZATION"}
+
+    def attempts(self, job_id=None):
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM attempts WHERE job_id=? ORDER BY rowid", (job_id,)) if job_id else db.execute("SELECT * FROM attempts ORDER BY rowid")
+            return [dict(r) for r in rows]
+
+    def reserve(self, job_id, task, attempt, quote, verify_cost, expected_version=None):
+        key = payment_key(job_id, task.id, attempt)
+        with self.tx() as db:
+            previous = db.execute("SELECT * FROM attempts WHERE key=?", (key,)).fetchone()
+            if previous:
+                if canonical(quote.public()) != previous["quote"] or verify_cost != previous["verify_cost"]:
+                    raise PolicyError("Idempotency key cannot change purchase terms")
+                return key
+            job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job or job["status"] != "RUNNING" or db.execute("SELECT halted FROM control").fetchone()[0]:
+                raise PolicyError("Payments are halted or job is not running")
+            if expected_version is not None and job['mandate_version'] != expected_version:
+                raise PolicyError('Mandate version changed before reservation')
+            if time.time() >= job["expires_at"] or time.time() >= quote.expires_at:
+                raise PolicyError("Mandate or quote expired")
+            if quote.provider not in {"economy", "balanced", "premium", "metal-provider", "local-gpu", "hosted-premium"} or not 0 <= attempt < 3:
+                raise PolicyError("Provider or attempt is outside mandate")
+            if type(quote.price) is not int or type(verify_cost) is not int or quote.price <= 0 or verify_cost < 0:
+                raise PolicyError("Money must be integer micro-USD")
+            if quote.price > job["price_cap"]:
+                raise PolicyError("Per-call price cap exceeded")
+            public_tasks = json.loads(job["tasks"])
+            if task.public() not in public_tasks:
+                raise PolicyError("Task is outside the approved job")
+            if db.execute("SELECT 1 FROM attempts WHERE job_id=? AND step_id=? AND (passed=1 OR state IN ('RESERVED','DISPATCHING','PAID'))", (job_id, task.id)).fetchone():
+                raise PolicyError("Step is accepted or has an unresolved purchase")
+            reserved = db.execute("SELECT COALESCE(SUM(price+verify_cost),0) FROM attempts WHERE job_id=? AND state IN ('RESERVED','DISPATCHING','PAID')", (job_id,)).fetchone()[0]
+            total = quote.price + verify_cost
+            if job["spent"] + reserved + total > min(job["hold"], job["budget"]):
+                raise PolicyError("Customer hold or budget would be exceeded")
+            rail_reserved = db.execute("SELECT COALESCE(SUM(price),0) FROM attempts WHERE job_id=? AND state IN ('RESERVED','DISPATCHING')", (job_id,)).fetchone()[0]
+            shortfall = job["rail_spent"] + rail_reserved + quote.price - job["allocation"]
+            if shortfall > 0:
+                if db.execute('SELECT float_mode FROM runs WHERE id=?', (job['run_id'],)).fetchone()[0] != 'SIMULATED':
+                    raise PolicyError('Real wallet allocation exhausted; no automatic cross-wallet float top-up')
+                run = db.execute("SELECT float_total FROM runs WHERE id=?", (job["run_id"],)).fetchone()[0]
+                allocated = db.execute("SELECT SUM(allocation) FROM jobs WHERE run_id=?", (job["run_id"],)).fetchone()[0]
+                topup = min(max(shortfall, 100000), run - allocated, job["hold"] - job["allocation"])
+                if topup < shortfall:
+                    raise PolicyError("Operator float exhausted; approval or new float required")
+                db.execute("UPDATE jobs SET allocation=allocation+? WHERE id=?", (topup, job_id))
+                self._event(db, "FLOAT_TOPUP", {"job_id": job_id, "amount": topup, "mode": "SIMULATED"})
+            db.execute("INSERT INTO attempts(key,job_id,step_id,attempt,state,quote,provider,price,verify_cost,mandate_version) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       (key, job_id, task.id, attempt, "RESERVED", canonical(quote.public()), quote.provider, quote.price, verify_cost, job['mandate_version']))
+            self._event(db, "RESERVED", {"job_id": job_id, "step_id": task.id, "key": key, "quote_id": quote.id, "amount": total})
+        return key
+
+    def approval_required(self, key, db=None):
+        if db is None:
+            with self.connect() as conn:
+                return self.approval_required(key, conn)
+        row = db.execute('SELECT r.float_mode,r.require_approvals,a.quote FROM attempts a JOIN jobs j ON j.id=a.job_id JOIN runs r ON r.id=j.run_id WHERE a.key=?', (key,)).fetchone()
+        return bool(row and (row['float_mode']=='TESTNET' or row['require_approvals'] or json.loads(row['quote']).get('mode')=='TESTNET'))
+
+    def _approval_terms(self, db, key):
+        from .procurement_approval import make_terms, ApprovalError
+        row = db.execute('SELECT * FROM attempts WHERE key=?', (key,)).fetchone()
+        if not row: raise ApprovalError('APPROVAL_REQUIRED')
+        job = dict(db.execute('SELECT * FROM jobs WHERE id=?', (row['job_id'],)).fetchone())
+        if row['mandate_version'] != job['mandate_version']: raise ApprovalError('MANDATE_VERSION_MISMATCH')
+        task = next(t for t in json.loads(job['tasks']) if t['id']==row['step_id'])
+        mode = db.execute('SELECT float_mode FROM runs WHERE id=?', (job['run_id'],)).fetchone()[0]
+        cfg = self.approvals._config()
+        if mode=='TESTNET' and cfg['chain_id']!=63825: raise ApprovalError('TERMS_MISMATCH')
+        return make_terms(job, task, json.loads(row['quote']), key, row['attempt'], row['verify_cost'], cfg, simulated=mode=='SIMULATED')
+
+    def prepare_approval(self, key):
+        with self.connect() as db:
+            row = db.execute('SELECT state FROM attempts WHERE key=?', (key,)).fetchone()
+            if not row or row['state']!='RESERVED':
+                from .procurement_approval import ApprovalError
+                raise ApprovalError('APPROVAL_ALREADY_CONSUMED')
+            terms = self._approval_terms(db, key)
+        return self.approvals.prepare(terms)
+
+    def assert_can_pay(self, key, worker_token=None):
+        from .procurement_approval import ApprovalError
+        try:
+            return self._assert_can_pay(key, worker_token)
+        except ApprovalError as error:
+            self.event('PROCUREMENT_APPROVAL_BLOCKED', {'purchase_key': key, 'code': error.code})
+            self.approvals.expire()
+            raise
+
+    def _assert_can_pay(self, key, worker_token=None):
+        """Authorize once: mandate/halt/lease checks and DISPATCHING share a transaction.
+
+        Halt after this commit cannot cancel the already authorized external call.
+        A second worker must reconcile DISPATCHING, never dispatch it again.
+        """
+        with self.tx() as db:
+            row = db.execute("SELECT a.*,j.status,j.expires_at,j.mandate_version AS current_version FROM attempts a JOIN jobs j ON a.job_id=j.id WHERE key=?", (key,)).fetchone()
+            if row and row['state']!='RESERVED':
+                from .procurement_approval import ApprovalError
+                approval=db.execute('SELECT state FROM procurement_approvals WHERE purchase_key=? ORDER BY rowid DESC LIMIT 1',(key,)).fetchone()
+                code={'REVOKED':'APPROVAL_REVOKED','EXPIRED':'APPROVAL_EXPIRED','CONSUMED_AT_DISPATCH':'APPROVAL_ALREADY_CONSUMED'}.get(approval['state']) if approval else None
+                if code: raise ApprovalError(code)
+            if not row or row["state"] != "RESERVED" or row["status"] != "RUNNING" or db.execute("SELECT halted FROM control").fetchone()[0]:
+                raise PolicyError("Payment dispatch is stopped")
+            if row['mandate_version'] != row['current_version']:
+                from .procurement_approval import ApprovalError
+                raise ApprovalError('MANDATE_VERSION_MISMATCH')
+            lease = db.execute('SELECT token,active FROM worker_leases WHERE job_id=?', (row['job_id'],)).fetchone()
+            if (worker_token is not None and (not lease or not lease['active'] or lease['token'] != worker_token)
+                or lease and lease['active'] and lease['token'] != worker_token):
+                raise PolicyError('Worker lease is not owned by this dispatcher')
+            if time.time() >= row["expires_at"] or time.time() >= json.loads(row["quote"])["expires_at"]:
+                from .procurement_approval import ApprovalError
+                raise ApprovalError('QUOTE_EXPIRED')
+            authorization = None
+            job = db.execute('SELECT * FROM jobs WHERE id=?',(row['job_id'],)).fetchone()
+            q = json.loads(row['quote'])
+            reserved=db.execute("SELECT COALESCE(SUM(price+verify_cost),0) FROM attempts WHERE job_id=? AND state IN ('RESERVED','DISPATCHING','PAID')",(job['id'],)).fetchone()[0]
+            rail_reserved=db.execute("SELECT COALESCE(SUM(price),0) FROM attempts WHERE job_id=? AND state IN ('RESERVED','DISPATCHING')",(job['id'],)).fetchone()[0]
+            if (row['price']!=q['price'] or row['provider']!=q['provider'] or row['price']>job['price_cap']
+                    or job['spent']+reserved>min(job['hold'],job['budget']) or job['rail_spent']+rail_reserved>job['allocation']):
+                if self.approval_required(key,db):
+                    from .procurement_approval import ApprovalError
+                    raise ApprovalError('TERMS_MISMATCH')
+                raise PolicyError('Financial limits or reserved terms changed before dispatch')
+            if self.approval_required(key, db):
+                authorization = self.approvals.consume(db, key, self._approval_terms(db, key))
+            db.execute("UPDATE attempts SET state='DISPATCHING',dispatched_at=?,worker_token=? WHERE key=?",
+                       (time.time(), worker_token, key))
+            self._event(db, 'DISPATCHING', {'key': key, 'job_id': row['job_id'],
+                'mandate_version': row['current_version'], 'worker_token': worker_token})
+            return authorization
+
+    def record_paid(self, key, receipt):
+        with self.tx() as db:
+            row = db.execute("SELECT * FROM attempts WHERE key=?", (key,)).fetchone()
+            if not row or receipt["key"] != key or receipt["amount"] != row["price"] or receipt["quote_id"] != json.loads(row["quote"])["id"] or receipt["provider"] != row["provider"]:
+                raise PolicyError("Receipt does not match reserved purchase")
+            metadata = receipt.get("provider_metadata")
+            metadata_json = None
+            if metadata is not None:
+                allowed_fields = {"provider_type", "provider_model", "usage", "latency_ms", "chaos_mode", "funding_source", "hosted_api_cost"}
+                allowed_usage = {"input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"}
+                usage = metadata.get("usage", {}) if isinstance(metadata, dict) else None
+                valid = (isinstance(metadata, dict) and not set(metadata) - allowed_fields
+                         and metadata.get("provider_type") in {"LOCAL_MODEL", "ANTHROPIC_API", "LOCAL_TOOL"}
+                         and (metadata.get("provider_model") is None or
+                              isinstance(metadata.get("provider_model"), str) and len(metadata["provider_model"]) <= 128)
+                         and isinstance(usage, dict) and not set(usage) - allowed_usage
+                         and all(type(value) is int and value >= 0 for value in usage.values())
+                         and (metadata.get("latency_ms") is None or
+                              type(metadata["latency_ms"]) is int and metadata["latency_ms"] >= 0)
+                         and metadata.get("chaos_mode") in {None, "quality-drop"}
+                         and metadata.get('funding_source') in {None, 'UNVERIFIED', 'PARTNER_CREDITS_OPERATOR_DECLARED'})
+                if valid and 'hosted_api_cost' in metadata:
+                    # Retain only reproducible usage-based estimates, never a
+                    # seller's arbitrary charge or a claim of reconciled billing.
+                    from .hosted_cost import estimate_usage
+                    valid = (metadata.get('provider_type') == 'ANTHROPIC_API'
+                             and metadata['hosted_api_cost'] == estimate_usage(metadata.get('provider_model'), usage))
+                if valid:
+                    metadata_json = canonical(metadata)
+                else:
+                    metadata = None
+            existing = db.execute("SELECT receipt FROM payments WHERE key=?", (key,)).fetchone()
+            if existing:
+                if existing[0] != receipt["id"]:
+                    raise PolicyError("Conflicting receipt")
+                if row["provider_metadata"] is None and metadata_json:
+                    db.execute("UPDATE attempts SET provider_metadata=? WHERE key=?", (metadata_json, key))
+                    self._event(db, "PROVIDER_MEASUREMENT", {"job_id": row["job_id"], "key": key,
+                        "provider": row["provider"], "metadata": metadata, "mode": receipt.get("mode", "UNKNOWN")})
+                return
+            if row["state"] not in {'RESERVED', 'DISPATCHING'}:
+                raise PolicyError("No active reservation")
+            db.execute("INSERT INTO payments VALUES(?,?,?)", (key, receipt["id"], receipt["amount"]))
+            db.execute("UPDATE attempts SET state='PAID',receipt=?,provider_metadata=? WHERE key=?",
+                       (receipt["id"], metadata_json, key))
+            db.execute("UPDATE jobs SET rail_spent=rail_spent+? WHERE id=?", (receipt["amount"], row["job_id"]))
+            payload = {"job_id": row["job_id"], "key": key, "receipt": receipt["id"],
+                       "amount": receipt["amount"], "provider": row["provider"],
+                       "mode": receipt.get("mode", "SIMULATED")}
+            if metadata:
+                payload["provider_metadata"] = metadata
+            self._event(db, "PAID", payload)
+
+    def finish_attempt(self, key, output, verdict):
+        with self.tx() as db:
+            row = db.execute("SELECT * FROM attempts WHERE key=?", (key,)).fetchone()
+            if not row or row["state"] != "PAID":
+                return
+            state = "VERIFIED_OK" if verdict["passed"] else "VERIFIED_FAIL"
+            db.execute("UPDATE attempts SET state=?,output=?,score=?,passed=?,reason=?,verdict=? WHERE key=?",
+                       (state, canonical(output), verdict["score"], int(verdict["passed"]), verdict["reason"], canonical(verdict), key))
+            db.execute("UPDATE jobs SET spent=spent+? WHERE id=?", (row["price"] + row["verify_cost"], row["job_id"]))
+            self._event(db, state, {"job_id": row["job_id"], "step_id": row["step_id"], "key": key, "provider": row["provider"], "score": verdict["score"], "reason": verdict["reason"], "method": verdict.get("method", "source-numeric"), "retryable": verdict.get("retryable", True)})
+
+    def void(self, key, reason, authoritative=False):
+        with self.tx() as db:
+            row = db.execute("SELECT job_id,state FROM attempts WHERE key=? AND state IN ('RESERVED','DISPATCHING')", (key,)).fetchone()
+            if row:
+                if row['state'] == 'DISPATCHING' and not authoritative:
+                    raise PolicyError('Dispatched reservations require authoritative non-payment evidence')
+                db.execute("UPDATE attempts SET state='VOID',reason=? WHERE key=?", (reason, key))
+                self._event(db, "RESERVATION_VOIDED", {"key": key, "reason": reason})
+
+    def status(self, job_id, state, reason=""):
+        with self.tx() as db:
+            db.execute("UPDATE jobs SET status=? WHERE id=?", (state, job_id))
+            self._event(db, state, {"job_id": job_id, "reason": reason})
+
+    def settle_job(self, job_id):
+        with self.tx() as db:
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row["status"] == "COMPLETED":
+                return
+            if db.execute("SELECT 1 FROM attempts WHERE job_id=? AND state IN ('RESERVED','DISPATCHING','PAID')", (job_id,)).fetchone():
+                raise PolicyError("Cannot capture while payment outcome is unresolved")
+            run = db.execute('SELECT float_mode,failed_call_policy FROM runs WHERE id=?', (row['run_id'],)).fetchone()
+            float_mode = run['float_mode']
+            failures = db.execute('SELECT COALESCE(SUM(price+verify_cost),0) FROM attempts WHERE job_id=? AND passed=0', (job_id,)).fetchone()[0]
+            captured = row['spent'] - (failures if run['failed_call_policy']=='MERCHANT_ABSORBS' else 0)
+            allocation = row['rail_spent'] if float_mode == 'SIMULATED' else row['allocation']
+            db.execute("UPDATE jobs SET status='COMPLETED',captured=?,released=hold-?,allocation=? WHERE id=?", (captured,captured,allocation,job_id))
+            unused = row['allocation'] - row['rail_spent']
+            self._event(db, "HOLD_CAPTURED", {"job_id": job_id, "captured": captured, "released": row["hold"] - captured,
+                "failed_call_policy":run['failed_call_policy'],
+                "unused_float_returned": unused if float_mode == 'SIMULATED' else 0,
+                "unused_float_pending": unused if float_mode == 'TESTNET' else 0,
+                "mode": "SIMULATED", "float_mode": float_mode})
+
+    def halt(self, reason="Operator halted new payment dispatches; in-flight charges require reconciliation"):
+        with self.tx() as db:
+            db.execute("UPDATE control SET halted=1")
+            db.execute("UPDATE jobs SET status='PAUSED_KILL' WHERE status='RUNNING'")
+            self._event(db, "KILL_SWITCH", {"reason": reason})
+
+    def resume(self):
+        with self.tx() as db:
+            db.execute("UPDATE control SET halted=0")
+            db.execute("UPDATE jobs SET status='RUNNING' WHERE status IN ('PAUSED_KILL','PAUSED_POLICY','PAUSED_RECOVERY','PAUSED_APPROVAL')")
+            self._event(db, "OPERATOR_RESUME", {"policy_changed": False})
+
+    def audit(self):
+        with self.connect() as db:
+            previous = "0" * 64
+            rows = db.execute("SELECT * FROM events ORDER BY id").fetchall()
+            for r in rows:
+                digest = hashlib.sha256(canonical([r["ts"], r["kind"], r["payload"], previous]).encode()).hexdigest()
+                if r["previous_hash"] != previous or r["hash"] != digest:
+                    return {"valid": False, "events": len(rows), "broken_at": r["id"]}
+                previous = digest
+            return {"valid": True, "events": len(rows), "head": previous}
+
+    def events(self, after=0, limit=100):
+        with self.connect() as db:
+            return [{**dict(r), "payload": json.loads(r["payload"])} for r in db.execute("SELECT * FROM events WHERE id>? ORDER BY id LIMIT ?", (after, limit))]

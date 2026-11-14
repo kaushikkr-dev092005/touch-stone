@@ -1,0 +1,34 @@
+# Procurement evidence
+
+Offline planning and real local tool execution. No payments sent.
+
+Model profile status: BLOCKED_STALE_OR_INVALID. Stale inputs cannot qualify a model; tool measurements are independent.
+
+Bounded tools solved 1000/1000 generated tasks over five new seeds with no model calls or provider spend. CPU p50 0.0016 ms; p95 0.0036 ms (single local run).
+
+No provider purchase. CPU, development, review and service costs are not priced; this is not a zero-total-cost claim.
+
+Authored boundary cases: 24/24 expectations met; 6 resolved and 18 deliberately deferred for review. Review is not task completion or measured real-world accuracy.
+
+| Provider | Task | Unique calibration sources | Consistently correct | Wilson lower bound | Screen |
+|---|---|---:|---:|---:|---|
+| economy | invoice | 0 | 0 | 0.0% | BLOCKED_STALE_OR_INVALID_PROFILE |
+| economy | arithmetic | 0 | 0 | 0.0% | BLOCKED_STALE_OR_INVALID_PROFILE |
+| economy | classification | 0 | 0 | 0.0% | BLOCKED_STALE_OR_INVALID_PROFILE |
+| balanced | invoice | 0 | 0 | 0.0% | BLOCKED_STALE_OR_INVALID_PROFILE |
+| balanced | arithmetic | 0 | 0 | 0.0% | BLOCKED_STALE_OR_INVALID_PROFILE |
+| balanced | classification | 0 | 0 | 0.0% | BLOCKED_STALE_OR_INVALID_PROFILE |
+
+Screen target: 95% success and at least 20 unique calibration sources, separately for each task kind. No model has live purchase authorization.
+
+Retrospective split of previously inspected profiles, not a pristine prospective holdout. Exact repeated sources are collapsed; template correlation remains. Evaluation rows do not enter the screen.
+
+Wilson lower bounds are screening diagnostics on narrow fixtures, not deployment accuracy guarantees. Task.min_quality is a response-check score, separate from the 95% provider success target.
+
+The classifier profile repeats only three distinct messages. Its 30 measurements per model do not represent 30 unique customer scenarios. Evaluation seed 43 has no unseen classification sources.
+
+The simulator dashboard retains its original financial stress scenario. The planning preview and CLI execute bounded tools separately, with explicit review on unsupported input. Neither the statistical screen nor this report enables a paid adapter.
+
+Next experiment: define representative de-identified finance-ops inputs and independent expected outcomes; freeze prompts/tools, collect a new prospective calibration/evaluation split, and measure a model only where deterministic tools abstain. Connect payment only after measured eligibility and funded recovery proof.
+
+Wilson formula reference: [NIST confidence intervals](https://www.itl.nist.gov/div898/handbook/prc/section2/prc241.htm).

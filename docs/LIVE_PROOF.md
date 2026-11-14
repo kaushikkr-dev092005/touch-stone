@@ -1,0 +1,147 @@
+# Live integration evidence — 30 October 2026
+
+## Current update — 5 November 2026
+
+**MEASURED: M1's real write/read-back gate PASSED.** Exactly one sandbox FX
+conversion sold **1.00 USD for 0.89 EUR**, settled, and matched both wallet-history
+entries. Observed USD cash debit: exactly 1.00. Its request-ID index returned 404;
+the report explicitly records a bounded read-only scan matching the conversion ID.
+
+One separately authorized hosted card session completed **1.00 USD authorization**
+and **0.01 USD capture**. The intent is SUCCEEDED; 0.99 was left uncaptured by final
+partial capture. Issuer release/credit timing is **UNMEASURED**. Exactly one session
+create and one capture request occurred; no cancel request was needed. Both
+transaction approvals are consumed. Historical native PaymentIntent errors do not
+establish the current account's hosted entitlement.
+
+Evidence: [FX](../bench/results/m1/live-fx-single-conversion.json),
+[separate treasury accounts](../bench/results/m1/live-treasury-job.json),
+[closed hosted authorization](../bench/results/m1/current-hosted-card-proof.json).
+Airwallex and Metal remain separate; the treasury demo-token entry is SIMULATED.
+Treasury audit head: `1855dc7889c605a2a406bb6cfa2df5a54ec544f7317869178ddbf86cae873e6c`.
+
+Fixes cover supported smoke pagination, token reuse, strict official sandbox-host
+validation, completed-capture read-back, account-bound readiness and exact FX-source
+reconciliation. Controlled regression tests exercise each path. No runtime dependency
+was added. [Current validation](VALIDATION.md).
+
+Allowed: these sandbox writes and their read-backs. Not allowed: issuer refund timing,
+an integrated three-customer banking run, enabled native checkout, a real hold increase,
+or a fiat/token bridge. No further M1 transaction is authorized or needed for this proof.
+
+**MEASURED: the single-call live integration and live crash/recovery gates PASSED.**
+This is one integration probe, not the full multi-job/30–50-step paid milestone.
+
+- One approved **0.02 USDZ** deposit funded `m2-live-single-20261105-j1`, using the
+  existing EVM funding wallet on chain **63825**. Both funding transactions succeeded.
+  Actual native fees totaled **451,768 wei**, below the **10^15 wei** aggregate cap.
+  The signer reserved gas-limit × max-fee exposure durably before signing; its cap
+  is immutable and survives process death. This optional guard was used for this deposit.
+- A pre-dispatch provider-ID mismatch paused with zero attempts and zero payments.
+  The existing `metal-provider` seller was configured to match the unchanged probe
+  policy. The same scope, task, mandate version, origin and caps were preserved;
+  no financial safety control or eligibility threshold was changed.
+- The unified engine purchased **one 0.01 USDZ inference** and exited **86** at
+  `after_rail`, before its local payment commit. Recovery attached the original
+  receipt to the reservation. Repeating recovery left **one invoice, one receipt,
+  zero pending attempts and zero new payments**.
+- Operator and payer signatures, incremental invoice and the operator's retained
+  receipt journal passed SDK verification. Original invoice, signed receipt and
+  delivery remain in the ignored wallet store; public evidence contains hashes.
+- The answer was **VERIFIED_FAIL**, not useful inference. Provider spend is real;
+  the **0.001 internal checking charge is SIMULATED**. Customer mandates/capture
+  in this probe are SIMULATED, with no Airwallex action and no withdrawal.
+- Remaining operator-estimated clearing spendability: **0.01 USDZ**. Receipt status
+  is **preconfirmed**; final on-chain purchase settlement is **not verified**.
+
+Evidence: [final result](../bench/results/m2/live-single-call-final.json),
+[funding](../bench/results/m2/live-capped-funding.json),
+[before dispatch](../bench/results/m2/live-before-dispatch.json),
+[hard process exit](../bench/results/m2/live-paid-kill-boundary.json),
+[recovery](../bench/results/m2/live-single-call-recovered.json),
+[repeat recovery](../bench/results/m2/live-repeat-recovery.json),
+[receipt verification](../bench/results/m2/live-receipt-verification.json).
+Final printed audit head (19 events):
+`72d6c9f1d1741925a79c239336f863f06a92ecab0fb70e56881020c78748ac53`.
+
+Allowed: one paid engine attempt, verified receipt/accounting and no observed duplicate
+in this live crash/recovery test. Not allowed: universal exactly-once guarantees,
+final settlement, model qualification, concurrent live customers or a paid comparison.
+The single purchase and deposit approvals are consumed. Further funding/purchases,
+hosted usage and withdrawals require separate explicit written caps. Local dashboard,
+balanced model and the `local-gpu` seller were restored after the isolated probe.
+No dependency or pinned SDK version changed. [Validation](VALIDATION.md).
+
+## Historical observations
+
+M2 update, 3 November: **no new live financial evidence**. [Current local preflight](../bench/results/m2/local-preflight.json) finds the existing signer and RPC through the normal local loader, correcting the earlier environment-only diagnosis. The RPC check fails and provider origin is unset, so execution stops without a purchase. The written one-call cap of 0.05 USDZ remains recorded. New concurrency, dispatch and process-kill recovery results are **MOCK**, not live Metal proof. See [M2 implementation report](M2_REPORT.md).
+
+M1 update, 2 November: **no new live financial evidence**. The environment-only doctor could not see the required Airwallex variables in the agent process and made no API requests. The user reports local setup in another terminal. A new treasury job lifecycle and scope-retirement path passed controlled-adapter tests; their saved proof is **MOCK**. No private historical scope was read or retired. See [M1 report](M1_REPORT.md) and [support draft](AIRWALLEX_SUPPORT_REQUEST.md).
+
+## Metal testnet: executed
+
+The dedicated EVM wallet was created locally; its private key is in ignored `data/metal/funding-wallet.json`. The user funded its public address using the Metal console faucet. Read-only RPC verification observed chain **63825**, with 100 testnet USDZ before the probe. Authenticated RPC URLs and API keys are excluded from this report.
+
+The probe deposited **0.10 testnet USDZ** into its own persisted clearing wallet, purchased **one 0.01 testnet USDZ inference call**, and retained the actual SDK invoice, signed receipt and output. `bench/results/metal-paid-proof.json` contains the redacted evidence. These are test assets, not a fiat conversion or a transfer from an Airwallex balance.
+
+| Evidence | Observed result |
+|---|---|
+| Approval transaction | `0x8824f8a68523a692805c64f1fec38eb1efbe1de2b96ebc9aff9b78cc637f5fda` |
+| Deposit transaction | `0xe0bcbffaa1a746c93c2efebeb741bbfea552ba77b513dbee9e43411cfb8eae08` |
+| Actual paid calls | 1 |
+| Provider | Local Qwen2.5 1.5B Q4_K_M on NVIDIA Vulkan |
+| Model output | `{"total_cents": 1250}` |
+| Source-correct answer | `{"total_cents": 2000}` |
+| Online verifier | Rejected the result |
+| Cached buyer retry | Identical original result; no second payment |
+| Provider receipt replay | Original signed proof returned identical stored delivery; no payment creation |
+| Receipt assurance | Preconfirmed; no per-call blockchain transaction hash invented |
+| Unused float | 0.09 testnet USDZ returned in non-deferred claim transaction `0x5e6f4e180c98f5843db3d98c7cc149c19e9f79c0c12b24235901ae3de30b398d`; withdrawal was queued in transaction `0xf5a00b55cdb84d5ffaf9d5a04b8c73aba7238ee858270641c8b05d4af8d73a98` |
+
+The SDK confirmed the withdrawal claim after epoch `93301` finalized. `returned_float_confirmed` is true. Run `python tools/prove_metal.py --withdraw-only --execute` to recheck withdrawal state; it retains the queue and claim transaction history and does not replay the paid inference request.
+
+The initial attempt hit a clearing epoch refusal. Recovery examined the durable SDK state, which stores pending before sending and clears it only for a verified receipt or authoritative refusal. An unpaid reservation could retry only the same URL, seller, deployment and price. Unknown held invoices retain the original SDK invoice and block replacement purchases. This behavior is covered by separate local tests.
+
+The test is an explicit protocol probe. These generated arithmetic inputs can be solved locally; the purchase is not a claim that inference was economically necessary. The failed answer and its charge remain in the evidence. Neither measured model has autonomous procurement authorization.
+
+## Airwallex sandbox: authenticated; direct create blocked; hosted fallback untested
+
+The supplied scoped key and Client ID authenticate successfully. After the user updated its account-level permissions, balance and Global Account reads both passed. No token, API key, raw account details, card body or client secret is retained in public evidence.
+
+PaymentIntent creation returns **HTTP 400 `configuration_error`** with the message:
+
+> Invalid request against merchant configuration. Please contact your account manager.
+
+No customer authorization or capture has been completed. See `bench/results/airwallex-hold-proof.json` and `airwallex-readiness.json`. Unresolved create scopes remain in the private operation journal; they have not been treated as successful authorizations or available liquidity.
+
+The direct PaymentIntent route remains blocked by merchant configuration. A browser-assisted alternative is now implemented with the beta Checkout Sessions API at version `2026-05-29`; it creates an uncaptured card session, returns a hosted URL to the operator, and verifies authorization from read-back state. That path is not yet exercised and requires the sandbox payment account ID, Checkout Sessions read/write scope, and an activated payment method. The [Checkout Sessions guide](https://www.airwallex.com/docs/payments/integration-options/web-checkout/checkout-session/quickstart) explains its account/API prerequisites, while [sandbox settings](https://www.airwallex.com/docs/developer-tools/sandbox-environment/sandbox-settings) notes Native API checkout/PCI enablement is not provisioned by default.
+
+The integrated `banked-proof-001` create operation is still journaled as `UNKNOWN` after HTTP 400 `duplicate_request`. A read-only lookup by its merchant order ID found no matching PaymentIntent at the time checked. Preserve this scope and do not count it as an authorization; the create outcome needs Airwallex reconciliation.
+
+## Integrated job implementation
+
+`python -m touchstone banked-job --scope banked-proof-001 --integration-probe --recover` resumes one durable sandbox/testnet job. Its immutable mandate includes source, provider URL, price cap, allocation, hold and purpose. The job obtains an actual authorization before allocating a funded clearing wallet, then reserves a quote, pays, verifies, captures accounted spend and tracks withdrawal claims. The full path passes controlled adapter tests; the actual banked job is currently blocked at PaymentIntent creation.
+
+Live probe checking fees are zero. Customer capture rounds provider spend down to whole cents and records the sub-cent difference as merchant expense. Gas and any native-token costs are not charged to the customer. Fiat and token accounts remain separate; no automated bridge is implemented. A separate Airwallex Treasury FX workflow has since been added, but it has not been configured or exercised and is not connected to Metal funding. Funded jobs sharing the EVM account are serialized to avoid nonce and allocation races.
+
+The three-job dashboard scenario remains a simulator. Its separate real-evidence panel and banked-job journal disclose the state of these integrations.
+
+## 2 November code update (not live evidence)
+
+The provider worker now supports hosted Claude through the Messages API with schema-constrained JSON and records the usage counts returned by that API. The buyer bridge strips Anthropic and Airwallex credentials from its child environment. Hosted delivery is at-most-once after the server durably marks a request running: a crash/timeout will not trigger a second potentially billable model call, but may leave a paid receipt with no recoverable answer.
+
+`engine-metal` now has three live-only policies for the local GPU tier and hosted premium tier. The local-only, hosted-only and local-first/escalate policies require both quote identities to pass a no-payment preflight, and their engine offers exclude every simulator quote. Each run measures Metal testnet spend plus verification charges per verifier-accepted output, stores reported hosted token counts, and writes a local evidence file for the dashboard's separate live-trial panel. This is an implemented path only: no Anthropic API request, matched three-policy paid run, or dashboard live-policy result has been recorded. Hosted API dollar cost is separate and excluded from the USDZ metric; customer capture is zero.
+
+No Airwallex write was attempted. `AIRWALLEX_ACCOUNT_ID` remains unset; Conversion Write scope, a specific approved currency pair/amount, the conversion and reconciliation against both wallet-history entries are outstanding. No AgentOS/CLI/MCP/skills or sponsor Slack connector is available in this workspace.
+
+## 1 November readiness update
+
+The Qwen2.5 0.5B Q4_K_M economy model runtime was started on the local Vulkan path; the loopback x402 seller reported model health ready on testnet chain 63825. `engine-metal --quote-only` obtained a $0.01 quote for a generated invoice task. Queue depth was zero and no payment was sent. The reported 1,000 ms latency is the provider's cold-start fallback with zero completed-delivery samples, not measured inference latency. This preflight did not produce a model output or paid engine step. Redacted evidence is saved in `bench/results/metal-provider-quote.json`.
+
+The seller's real outage chaos mode was also exercised on that quote-only route. It returned HTTP 503 before offer, and the engine reported "no purchase was dispatched"; no payment was sent. This verifies the no-quote outage boundary only. A paid quality-drop scenario and process-kill/restart still require an explicitly funded wallet and approved budget. Evidence is saved in `bench/results/metal-provider-outage.json`.
+
+The read-only `python -m touchstone airwallex-smoke` run authenticated and read balances and Global Accounts. It reported `account_context_configured: false` because `AIRWALLEX_ACCOUNT_ID` is unset; Checkout Sessions read access and FX conversion read access were therefore not tested. The smoke performed no writes. No Checkout Session, FX quote or conversion was created.
+
+The code now has a unified engine-facing Metal rail, explicit `engine-metal` command, queue-sensitive quotes with explicit latency sample counts, fail-closed recovery, opt-in provider outage/quality-drop modes and an abrupt process-kill recovery boundary. The live quote-only path and an outage returning 503 before quote have been exercised without payment. No 30–50 paid-step run, paid quality-drop run or real Metal kill/restart has taken place: the provider URL is not persistently configured, and the prior testnet wallet balance was withdrawn. The Airwallex customer-hold side remains `NOT_RECONCILED` in the engine because no customer authorization/capture completed. FX wallet-history reconciliation is a separate read-only report, not a customer-payment reconciliation.
+
+The invoice fault-injection study is synthetic: across 20 ten-line inputs and 100 seeded checks per input, the noisy checker false-accepted 79.0% of offsetting errors when sampling one line (20.9% when sampling five). The exact source-arithmetic checker false-accepted none of the 20 injected cases. These rates are test measurements, not real invoice prevalence estimates.

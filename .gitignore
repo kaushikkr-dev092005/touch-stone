@@ -1,0 +1,14 @@
+.tools/
+tmp/
+data/
+.env*
+!.env.example
+dist/
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.log
+*.pending
+node_modules/
+apps/web/public/data/evidence.json

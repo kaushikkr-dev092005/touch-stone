@@ -1,0 +1,15 @@
+{
+  "label": "MEASURED local test runs",
+  "python": {
+    "command": "python -m unittest discover -s tests -v",
+    "passed": 177,
+    "failed": 0,
+    "seconds": 51.473
+  },
+  "node": {
+    "command": "python tools/metal.py test",
+    "passed": 32,
+    "failed": 0
+  },
+  "scope": "Full Python and Node suites rerun after rendering completion. Final browser checks cover the same HTML hash. Financial/security backend files unchanged."
+}
